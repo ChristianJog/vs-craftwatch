@@ -1,11 +1,15 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using ProtoBuf;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 using Vintagestory.API.Server;
+using Vintagestory.API.Util;
+using Vintagestory.GameContent;
 
 namespace CraftWatch;
 
@@ -30,6 +34,12 @@ public class CraftWatchSystem : ModSystem
     private long lastServerNotifyMs;
     private bool serverSuspended;
 
+    // Context for attributing a write to the static field; shared by both sides of one process.
+    private static readonly object causeGate = new();
+    private static ICoreAPI? causeApi;
+    private static GuiPoller? causePoller;
+    private static int causeUsers;
+
     private ICoreClientAPI? capi;
     private RecipeWatcher? clientRecipes;
     private GridWatcher? clientGrid;
@@ -41,10 +51,26 @@ public class CraftWatchSystem : ModSystem
         CwLog.Open(GamePaths.DataPath);
         AttrTrace.Install();
         api.Network.RegisterChannel(ChannelName).RegisterMessageType<BugReport>();
+
+        // One subscription for the whole process: in singleplayer this class exists once per side.
+        lock (causeGate)
+        {
+            causeApi ??= api;
+            if (causeUsers++ == 0) AttrTrace.StaticWrite += OnStaticWrite;
+        }
     }
 
     public override void Dispose()
     {
+        lock (causeGate)
+        {
+            if (--causeUsers == 0)
+            {
+                AttrTrace.StaticWrite -= OnStaticWrite;
+                causeApi = null;
+                causePoller = null;
+            }
+        }
         CwLog.Write(sapi != null ? "S" : "C", "STOP", $"mod unloading; writes to defaultEmptyAttributes in total: {AttrTrace.Hits}");
         AttrTrace.Uninstall();
         CwLog.Close();
@@ -204,6 +230,40 @@ public class CraftWatchSystem : ModSystem
         // Check dialogs and the static attributes every frame: that also runs while the game is paused.
         guiPoller = new GuiPoller(api, clientRecipes);
         api.Event.RegisterRenderer(guiPoller, EnumRenderStage.Ortho, "craftwatch-guipoller");
+        causePoller = guiPoller;
+    }
+
+    /// <summary>
+    /// Something wrote to the static field. Record the context that names the cause: the item, the
+    /// handbook page that was open, and the barrel recipes that use the item as an ingredient —
+    /// the handbook renders those ingredient stacks without cloning them.
+    /// </summary>
+    private static void OnStaticWrite(string? item, string key)
+    {
+        ICoreAPI? api = causeApi;
+        if (api == null) return;
+
+        string page = causePoller?.HandbookPage ?? "-";
+        CwLog.Write("-", "CAUSE", $"item={item ?? "?"} key={key} handbookPage={page} dialogs=[{causePoller?.Current}]");
+        if (item == null) return;
+
+        var itemCode = new AssetLocation(item);
+        foreach (BarrelRecipe recipe in api.GetBarrelRecipes())
+        {
+            if (recipe.Ingredients is not { } ingredients) continue;
+            bool uses = ingredients.Any(ingredient => ingredient.Code != null &&
+                                                      (ingredient.Code.Equals(itemCode) || WildcardUtil.Match(ingredient.Code, itemCode)));
+            if (!uses) continue;
+
+            string output = recipe.Output?.Code?.ToString() ?? "?";
+
+            // Which page shows a recipe is decided by the handbook; a page code that names the output
+            // or an ingredient is the best available hint.
+            bool pageMentions = ingredients.Any(ingredient => ingredient.Code != null && page.Contains(ingredient.Code.Path))
+                                || page.Contains(new AssetLocation(output).Path);
+            CwLog.Write("-", "CAUSE", $"recipe kind=barrel code={recipe.Code} sealHours={recipe.SealHours} in=[{string.Join(" + ", ingredients.Select(ingredient => ingredient.Code))}] " +
+                                      $"out={output} pageMentions={pageMentions}");
+        }
     }
 
     private void ClientTick()
@@ -265,10 +325,14 @@ public class GuiPoller : IRenderer
     private readonly ICoreClientAPI capi;
     private readonly RecipeWatcher recipes;
     private HashSet<string> open = [];
+    private readonly Dictionary<Type, FieldInfo?> historyFields = [];
 
     public double RenderOrder => 1;
     public int RenderRange => 1;
     public string Current => string.Join(", ", open);
+
+    /// <summary>Code of the handbook page currently shown, null while the handbook is closed.</summary>
+    public string? HandbookPage { get; private set; }
 
     public GuiPoller(ICoreClientAPI capi, RecipeWatcher recipes)
     {
@@ -283,11 +347,19 @@ public class GuiPoller : IRenderer
             recipes.CheckDefaultAttributes();
 
             var now = new HashSet<string>();
+            string? page = null;
             foreach (GuiDialog dialog in capi.Gui.OpenedGuis.OfType<GuiDialog>())
             {
                 // Permanently visible HUD elements are not an event.
                 if (dialog.DialogType == EnumDialogType.HUD) continue;
                 now.Add(dialog.DebugName ?? dialog.GetType().Name);
+                if (dialog.GetType().Name.Contains("Handbook")) page = ReadHandbookPage(dialog);
+            }
+
+            if (page != HandbookPage)
+            {
+                HandbookPage = page;
+                if (page != null) CwLog.Write("C", "GUI", $"handbook page: {page}");
             }
 
             foreach (string name in now.Where(name => !open.Contains(name)))
@@ -304,6 +376,30 @@ public class GuiPoller : IRenderer
         {
             CwLog.Write("C", "ERROR", $"GuiPoller: {e.GetType().Name}: {e.Message}");
         }
+    }
+
+    /// <summary>
+    /// The handbook keeps its pages in a protected browse history; the page on top is the one shown.
+    /// Read by reflection so that the mod does not depend on the handbook's class layout at compile time.
+    /// </summary>
+    private string ReadHandbookPage(GuiDialog dialog)
+    {
+        Type type = dialog.GetType();
+        if (!historyFields.TryGetValue(type, out FieldInfo? field))
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            for (Type? t = type; t != null && field == null; t = t.BaseType) field = t.GetField("browseHistory", flags);
+            historyFields[type] = field;
+        }
+
+        if (field?.GetValue(dialog) is not IEnumerable history) return "(unknown)";
+        foreach (object? element in history)
+        {
+            // A Stack enumerates from the top.
+            object? shown = element?.GetType().GetField("Page")?.GetValue(element);
+            return shown?.GetType().GetProperty("PageCode")?.GetValue(shown) as string ?? "(search results)";
+        }
+        return "(overview)";
     }
 
     public void Dispose() { }

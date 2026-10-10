@@ -20,6 +20,10 @@
       <HintPath>$(VSPath)\VintagestoryAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="VSSurvivalMod">
+      <HintPath>$(VSPath)\Mods\VSSurvivalMod.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="0Harmony">
       <HintPath>$(VSPath)\Lib\0Harmony.dll</HintPath>
       <Private>false</Private>

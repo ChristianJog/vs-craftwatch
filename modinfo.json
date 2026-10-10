@@ -4,9 +4,9 @@
   "name": "CraftWatch",
   "description": "Diagnostic mod: watches recipe matching and the crafting grid and logs deviations (issue 9175). Read-only; a Harmony prefix logs writes to the static default attributes.",
   "authors": ["ChristianJog"],
-  "version": "0.2.1",
+  "version": "0.3.0",
   "side": "Universal",
   "requiredOnClient": false,
   "requiredOnServer": false,
-  "dependencies": { "game": "1.22.0" }
+  "dependencies": { "game": "1.22.0", "survival": "1.22.0" }
 }
