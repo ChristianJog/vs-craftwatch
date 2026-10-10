@@ -22,6 +22,13 @@ public class BugReport
     [ProtoMember(3)] public string ClientGrid = "";
 }
 
+/// <summary>Request from the server to the clients to repair their own shared stacks as well.</summary>
+[ProtoContract]
+public class RepairRequest
+{
+    [ProtoMember(1)] public string RequestedBy = "";
+}
+
 public class CraftWatchSystem : ModSystem
 {
     private const string ChannelName = "craftwatch";
@@ -50,7 +57,7 @@ public class CraftWatchSystem : ModSystem
     {
         CwLog.Open(GamePaths.DataPath);
         AttrTrace.Install();
-        api.Network.RegisterChannel(ChannelName).RegisterMessageType<BugReport>();
+        api.Network.RegisterChannel(ChannelName).RegisterMessageType<BugReport>().RegisterMessageType<RepairRequest>();
 
         // One subscription for the whole process: in singleplayer this class exists once per side.
         lock (causeGate)
@@ -113,7 +120,8 @@ public class CraftWatchSystem : ModSystem
         api.Network.GetChannel(ChannelName).SetMessageHandler<BugReport>(OnBugReport);
 
         api.ChatCommands.Create("cw")
-            .WithDescription("CraftWatch: write a mark and the current state to the log. '/cw full' additionally runs the game's own matching (which repairs corrupted ingredients).")
+            .WithDescription("CraftWatch: write a mark and the current state to the log. '/cw full' also logs what the game's full matching finds. " +
+                             "'/cw repair' resets the corrupted ingredient attributes so that crafting works again.")
             .RequiresPrivilege(Privilege.chat)
             .WithArgs(api.ChatCommands.Parsers.OptionalAll("text"))
             .HandleWith(args =>
@@ -125,8 +133,29 @@ public class CraftWatchSystem : ModSystem
                     DumpServerGrid(grid, "MARK", grid.ReferenceMatches());
                     if (text == "full") DumpWithGameMatching(grid);
                 }
+                if (text == "repair")
+                {
+                    string result = Repair(args.Caller.Player?.PlayerName ?? "console");
+                    return TextCommandResult.Success($"CraftWatch: {result}. Take an item out of the crafting grid and put it back in.");
+                }
                 return TextCommandResult.Success($"CraftWatch: mark written to {CwLog.FilePath}");
             });
+    }
+
+    /// <summary>
+    /// Repairs the server's shared stacks and asks all clients to repair theirs. This is the only
+    /// action of the mod that changes game state; it runs on the explicit command '/cw repair'.
+    /// The cause is untouched: the next write to the static field breaks crafting again.
+    /// </summary>
+    public string Repair(string requestedBy)
+    {
+        if (sapi == null || serverRecipes == null) return "not running on a server";
+
+        string result = serverRecipes.Repair();
+        AttrTrace.Forget();
+        CwLog.Write("S", "REPAIR", $"requested by {requestedBy}: {result}");
+        sapi.Network.GetChannel(ChannelName).BroadcastPacket(new RepairRequest { RequestedBy = requestedBy });
+        return result;
     }
 
     private void ServerTick()
@@ -190,8 +219,9 @@ public class CraftWatchSystem : ModSystem
     }
 
     /// <summary>
-    /// Only on explicit command: asks the game's full matching. That reads the ingredients through
-    /// the getter and resets their attributes while doing so, i.e. it removes the finding.
+    /// Only on explicit command: logs what the game's full matching finds for the grid. It finds the
+    /// recipe even while the fast path is broken, which shows that the full matching is not the
+    /// part that fails. It repairs nothing.
     /// </summary>
     private void DumpWithGameMatching(GridWatcher grid)
     {
@@ -209,7 +239,7 @@ public class CraftWatchSystem : ModSystem
                 CwLog.Write("S", "ERROR", $"Matches throws for {recipe.Name}: {e.GetType().Name}: {e.Message}");
             }
         }
-        CwLog.Write("S", "DIAG", $"FULL GridRecipe.Matches finds [{string.Join("; ", found.Take(6))}] — NOTE: this call has repaired corrupted ingredients");
+        CwLog.Write("S", "DIAG", $"FULL GridRecipe.Matches finds [{string.Join("; ", found.Take(6))}]");
     }
 
     #endregion
@@ -226,6 +256,13 @@ public class CraftWatchSystem : ModSystem
         api.Event.RegisterGameTickListener(_ => ClientTick(), TickMs);
         api.Event.PauseResume += paused => CwLog.Write("C", "EVENT", paused ? "pause on" : "pause off");
         api.Event.LeaveWorld += () => CwLog.Write("C", "EVENT", "leaving world");
+        api.Network.GetChannel(ChannelName).SetMessageHandler<RepairRequest>(request =>
+        {
+            string result = clientRecipes.Repair();
+            AttrTrace.Forget();
+            CwLog.Write("C", "REPAIR", $"requested by {request.RequestedBy}: {result}");
+            api.ShowChatMessage($"[CraftWatch] client: repair done ({result})");
+        });
 
         // Check dialogs and the static attributes every frame: that also runs while the game is paused.
         guiPoller = new GuiPoller(api, clientRecipes);

@@ -12,9 +12,11 @@ namespace CraftWatch;
 /// Watches recipe matching on one side (client or server) independently of the crafting grid:
 /// the shared ingredient stacks, the static default attributes and the recipe data.
 ///
-/// This class is strictly read-only. It calls neither GridRecipe.Matches nor the getter
-/// CraftingRecipeIngredient.ResolvedItemStack: both reset the attributes of the stack they read
-/// and would remove the very corruption this class is meant to observe.
+/// Observation is strictly read-only. In particular it does not go through the getter
+/// CraftingRecipeIngredient.ResolvedItemStack, which writes to the shared stack while reading it;
+/// the raw state is read from the fast-search dictionary instead.
+///
+/// The single exception is <see cref="Repair"/>, which runs only on the explicit command '/cw repair'.
 /// </summary>
 public class RecipeWatcher
 {
@@ -135,8 +137,7 @@ public class RecipeWatcher
         int instance = RuntimeHelpers.GetHashCode(attributes);
         if (instance != attrsInstance)
         {
-            // The game only replaces the instance when it found it non-empty.
-            CwLog.Write(side, "ATTRS", $"defaultEmptyAttributes replaced: #{attrsInstance:x} -> #{instance:x} (the game discarded a non-empty instance)");
+            CwLog.Write(side, "ATTRS", $"defaultEmptyAttributes replaced: #{attrsInstance:x} -> #{instance:x}");
             attrsInstance = instance;
         }
 
@@ -306,6 +307,43 @@ public class RecipeWatcher
             }
         }
         return text.ToString();
+    }
+
+    /// <summary>
+    /// The one place where the mod writes to game state. Gives the static field a fresh, empty
+    /// attribute tree if it carries entries, and re-attaches to it every shared stack that the
+    /// fast path accepted at start and no longer accepts. Stacks with legitimate attributes of
+    /// their own are left alone. Returns a description for the log.
+    /// </summary>
+    public string Repair()
+    {
+        if (!BaselineTaken) return "no baseline yet, nothing done";
+
+        ITreeAttribute before = CraftingRecipeIngredient.defaultEmptyAttributes;
+        ITreeAttribute current = before;
+        if (current.Count != 0) CraftingRecipeIngredient.defaultEmptyAttributes = current = new TreeAttribute();
+
+        var dict = World.FastSearchRecipesByIngredient;
+        int reattached = 0, stillBroken = 0;
+        for (int i = 0; i < dict.Count && i < fastPathOkAtStart.Length; i++)
+        {
+            var key = dict.GetAt(i).Key;
+            ItemStack? stack = key.ResolvedItemStack;
+            if (stack == null || !fastPathOkAtStart[i] || FastPathAcceptsOwnItem(key)) continue;
+
+            stack.Attributes = current;
+            if (FastPathAcceptsOwnItem(key)) reattached++;
+            else stillBroken++;
+        }
+
+        // This side knows about the replacement; do not report it again as a finding.
+        attrsInstance = RuntimeHelpers.GetHashCode(current);
+        attrsDirty = current.Count != 0;
+
+        string field = ReferenceEquals(before, current)
+            ? "static field was empty"
+            : $"static field replaced (#{RuntimeHelpers.GetHashCode(before):x} -> #{RuntimeHelpers.GetHashCode(current):x})";
+        return $"{field}, {reattached} shared stacks re-attached, {stillBroken} still broken";
     }
 
     public string Summary => $"stacks withAttributes/onOtherTree/fastPathBroken={sharedSummary}, " +

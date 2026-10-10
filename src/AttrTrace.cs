@@ -84,6 +84,19 @@ public static class AttrTrace
         }
     }
 
+    /// <summary>
+    /// Forgets which call stacks and items were already logged. Called after a repair, so that the
+    /// next write is recorded in full again even if it comes from the same place.
+    /// </summary>
+    public static void Forget()
+    {
+        lock (gate)
+        {
+            seenTraces.Clear();
+            seenItems.Clear();
+        }
+    }
+
     public static void Uninstall()
     {
         lock (gate)

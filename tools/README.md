@@ -1,7 +1,9 @@
 # craftwatch_report.py
 
-Turns the log files of the [CraftWatch](../README.md) mod into one HTML page. The page is made to
-answer three questions quickly:
+Turns the log files of the [CraftWatch](../README.md) mod into one HTML page. A log can contain
+several incidents: each starts with a write to the shared static attributes and ends with a repair
+(`/cw repair`) or with the end of the log. For every incident the page is made to answer three
+questions quickly:
 
 1. **When** did the bug occur?
 2. **Which recipe** was being crafted and no longer works?
@@ -35,8 +37,8 @@ the page it wrote. It only reads the logs and writes that one HTML file.
 
 ## What the page shows
 
-At the top there is a table of all logs with their result. For every log follow three boxes and
-the log itself.
+At the top there is a table of all logs with their result and, if a log has more than one, its
+incidents. For every incident follow three boxes, and for every log the log itself.
 
 **1 · Cause** — the write to the shared static attributes:
 
@@ -52,7 +54,9 @@ the log itself.
 
 - per side (server, client) the time and the numbers: ingredients no longer accepted by the fast
   path, stacks that carry foreign attributes, affected recipe references, a few examples
-- whether the state recovered before the log ended
+- if the incident was repaired: when, by whom, how many stacks were re-attached, and the first
+  craft after it for which the server filled the output slot again
+- otherwise whether the state recovered before the log ended
 
 **3 · Failed craft** — the recipe that matches while the output slot stays empty:
 
@@ -60,8 +64,9 @@ the log itself.
 - the recipe, the ingredients it needs, the content of the grid and the output slot
 - per ingredient whether server and client still accept it
 
-**Log** — every entry with its time, the time relative to the write, side and kind. The three
-moments above are highlighted and can be reached with the "show in log" links. "key events only"
+**Log** — every entry with its time, the time relative to the write of its incident, side and
+kind. The moments above and the repairs are highlighted, labelled with the number of their
+incident, and can be reached with the "show in log" links. "key events only"
 hides everything but the entries that matter; the other checkboxes hide single kinds. Long runs of
 similar lines and long messages are folded and open on a click.
 
@@ -69,12 +74,14 @@ similar lines and long messages are folded and open on a click.
 
 | Result | Condition |
 |---|---|
-| Bug occurred | the log contains an `ALARM SIGNATURE`: a recipe matched and the output slot stayed empty. The server's view is preferred over the client's. |
-| Corruption, no failed craft recorded | there is a write to the static field or broken ingredients, but no craft was attempted afterwards |
+| Bug occurred | an incident contains an `ALARM SIGNATURE`: a recipe matched and the output slot stayed empty. The server's view is preferred over the client's. |
+| Corruption, no failed craft recorded | there is a write to the static field or broken ingredients, but no craft was attempted before the incident ended |
 | No bug in this log | neither of the above |
 
-The cause is the first `TRACE` line that reports a write to `defaultEmptyAttributes`. The damage
-is the first report at or after that time in which the fast path rejects at least one ingredient.
+Incidents are separated by the `REPAIR` lines of the server. Within an incident the cause is the
+first `TRACE` line that reports a write to `defaultEmptyAttributes`; further writes are listed.
+The damage is the first report at or after that time in which the fast path rejects at least one
+ingredient.
 
 ## Limits
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Render CraftWatch log files as one HTML page.
 
-The page answers three questions per log file:
+A log can contain several incidents: each starts with a write to the shared static attributes
+and ends with a repair ('/cw repair') or with the end of the log. For every incident the page
+answers three questions:
   1. When did the bug occur?
   2. Which recipe was being crafted and is now broken?
   3. Which handbook recipe probably caused it?
@@ -42,9 +44,11 @@ INGREDIENT_RAW = re.compile(
     r"(?:zutat|ingredient)(\d+) (\S+): (?:ROH|RAW) (.*?)(?: (?:eigenesItem|acceptsOwnItem)=(\w+))?(?: (?:schnellpfadGegenGrid|fastPathVsGrid)=(\w+))?(?= \|\| |$)")
 CAUSE_ITEM = re.compile(r"^item=(\S+) key=(\S*) handbookPage=(.*?) dialogs=\[(.*)\]$")
 CAUSE_RECIPE = re.compile(r"^recipe kind=(\S+) code=(\S+) sealHours=(\S+) in=\[(.*?)\] out=(\S+) pageMentions=(\w+)$")
+REPAIR = re.compile(r"^requested by (.*?): (.*?), (\d+) shared stacks re-attached, (\d+) still broken$")
 FRAME = re.compile(r"^\s+at (.+?)(?: in (.+?):line (\d+))?$")
 
-KEY_KINDS = {"TRACE", "CAUSE", "ATTRS", "ALARM", "MARK"}
+KEY_KINDS = {"TRACE", "CAUSE", "ATTRS", "ALARM", "MARK", "REPAIR"}
+EMPTY = ("leer", "empty")
 
 
 @dataclass
@@ -55,8 +59,30 @@ class Entry:
     kind: str
     message: str
     extra: list[str] = field(default_factory=list)
-    tag: str = ""        # short machine label: write, damage, signature, report, canary, ...
-    key: bool = False    # one of the moments the page points to
+    tag: str = ""        # short machine label: write, damage, signature, report, repair, canary, ...
+    label: str = ""      # set for the moments the page points to, e.g. "#2 · cause"
+
+
+@dataclass
+class Incident:
+    """One occurrence of the bug: from a write to the static field up to a repair or the end of the log."""
+    session: "Session"
+    number: int
+    start: int                      # index of the first entry that belongs to it
+    end: int                        # index after the last entry
+    cause: Entry | None = None
+    writes: list[Entry] = field(default_factory=list)
+    damage: dict[str, Entry] = field(default_factory=dict)
+    symptom: Entry | None = None
+    repair: Entry | None = None
+
+    @property
+    def entries(self) -> list[Entry]:
+        return self.session.entries[self.start:self.end]
+
+    @property
+    def moment(self) -> Entry:
+        return self.cause or self.symptom or next(iter(self.damage.values()))
 
 
 @dataclass
@@ -65,9 +91,7 @@ class Session:
     entries: list[Entry]
     mod: str = "?"
     game: str = "?"
-    cause: Entry | None = None
-    damage: dict[str, Entry] = field(default_factory=dict)
-    symptom: Entry | None = None
+    incidents: list[Incident] = field(default_factory=list)
 
 
 def parse(path: Path) -> Session:
@@ -90,19 +114,53 @@ def parse(path: Path) -> Session:
             if found:
                 session.mod, session.game = found.groups()
 
-    # The three moments. The server decides whether crafting works, so its view wins.
-    session.cause = first(entries, lambda e: e.tag == "write") or first(entries, lambda e: e.tag == "attrs-filled")
-    since = session.cause.time if session.cause else datetime.min
-    for side in "SC":
-        hit = first(entries, lambda e, s=side: e.side == s and e.time >= since and is_damage(e))
-        if hit:
-            session.damage[side] = hit
-    session.symptom = (first(entries, lambda e: e.tag == "signature" and e.side == "S")
-                       or first(entries, lambda e: e.tag == "signature"))
-    for moment in [session.cause, session.symptom, *session.damage.values()]:
-        if moment:
-            moment.key = True
+    # A repair closes an incident. The server decides whether crafting works, so its repairs
+    # are the boundaries; the client's are used only if the server logged none.
+    repairs = [e for e in entries if e.tag == "repair" and e.side == "S"] or [e for e in entries if e.tag == "repair"]
+    bounds = [(0, None)] if not repairs else []
+    previous = 0
+    for repair in repairs:
+        bounds.append((previous, repair))
+        previous = repair.index + 1
+    if repairs:
+        bounds.append((previous, None))
+
+    for start, repair in bounds:
+        end = repair.index + 1 if repair else len(entries)
+        incident = build_incident(session, len(session.incidents) + 1, start, end, repair)
+        if incident:
+            session.incidents.append(incident)
     return session
+
+
+def build_incident(session: Session, number: int, start: int, end: int, repair: Entry | None) -> Incident | None:
+    part = session.entries[start:end]
+    incident = Incident(session, number, start, end, repair=repair)
+    incident.writes = [entry for entry in part if entry.tag == "write"]
+    incident.cause = incident.writes[0] if incident.writes else first(part, lambda e: e.tag == "attrs-filled")
+
+    since = incident.cause.time if incident.cause else datetime.min
+    for side in "SC":
+        hit = first(part, lambda e, s=side: e.side == s and e.time >= since and is_damage(e))
+        if hit:
+            incident.damage[side] = hit
+    # The server decides whether crafting works, so its view of the failed craft wins.
+    incident.symptom = (first(part, lambda e: e.tag == "signature" and e.side == "S")
+                        or first(part, lambda e: e.tag == "signature"))
+
+    if not (incident.cause or incident.damage or incident.symptom):
+        return None
+
+    prefix = f"#{number} · "
+    if incident.cause:
+        incident.cause.label = prefix + "cause"
+    for entry in incident.damage.values():
+        entry.label = prefix + "damage"
+    if incident.symptom:
+        incident.symptom.label = prefix + "failed craft"
+    if repair:
+        repair.label = prefix + "repair"
+    return incident
 
 
 def first(entries, predicate):
@@ -123,6 +181,8 @@ def classify(entry: Entry) -> None:
         entry.tag = "write"
     elif entry.kind == "ATTRS" and ("BEFUELLT" in message or "NOT EMPTY" in message):
         entry.tag = "attrs-filled"
+    elif entry.kind == "REPAIR":
+        entry.tag = "repair"
     elif entry.kind == "ALARM":
         if "CANARY" in message:
             entry.tag = "canary"
@@ -137,9 +197,7 @@ def classify(entry: Entry) -> None:
             entry.tag = "damage-update"
         elif "veraendert" in message:
             entry.tag = "damage"          # 0.1.0 logs one line per stack
-    elif entry.kind == "GUI" and "Handbook" in message:
-        entry.tag = "handbook"
-    elif entry.kind == "GUI" and message.startswith("handbook page:"):
+    elif entry.kind == "GUI" and ("Handbook" in message or message.startswith("handbook page:")):
         entry.tag = "handbook"
 
 
@@ -180,17 +238,16 @@ def culprit_frames(entry: Entry) -> list[tuple[str, str]]:
     return frames
 
 
-def cause_details(session: Session):
-    """Item, handbook page and candidate recipes recorded right after the write (0.3.0+)."""
-    cause = session.cause
+def write_context(incident: Incident, write: Entry):
+    """Item, handbook page and candidate recipes recorded right after a write (0.3.0+)."""
     item = page = None
     recipes = []
-    if cause is None:
-        return item, page, recipes
-    found = WRITE.search(cause.message)
+    found = WRITE.search(write.message)
     if found and found.group(4) and found.group(4) != "?":
         item = found.group(4)
-    for entry in session.entries[cause.index:cause.index + 400]:
+    for entry in incident.session.entries[write.index + 1:incident.end]:
+        if entry.tag == "write":
+            break
         if entry.kind != "CAUSE":
             continue
         match = CAUSE_ITEM.match(entry.message)
@@ -242,6 +299,18 @@ def recipe_definition(session: Session, entry: Entry, side: str):
     return None, [], []
 
 
+def crafted_after(session: Session, repair: Entry):
+    """The first grid line after a repair in which the server filled the output slot again."""
+    for entry in session.entries[repair.index + 1:]:
+        if entry.tag in ("write", "attrs-filled"):
+            return None                      # broken again before anything was crafted
+        if entry.kind == "GRID" and entry.side == "S":
+            match = GRID.match(entry.message)
+            if match and match.group(3) not in EMPTY:
+                return entry, match
+    return None
+
+
 def short(code: str) -> str:
     return code.split(":", 1)[1] if ":" in code else code
 
@@ -260,13 +329,14 @@ def delta(later: datetime, earlier: datetime) -> str:
 # ----------------------------------------------------------------------------- html
 
 E = html.escape
+NOT_RECORDED = '<span class="muted">not recorded (needs CraftWatch 0.3.0 or newer)</span>'
 
 
 def anchor(session_id: str, entry: Entry) -> str:
     return f"{session_id}-e{entry.index}"
 
 
-def jump(session_id: str, entry: Entry, text: str) -> str:
+def jump(session_id: str, entry: Entry, text: str = "show in log") -> str:
     return f'<a class="jump" href="#{anchor(session_id, entry)}">{E(text)}</a>'
 
 
@@ -274,22 +344,26 @@ def code_list(codes) -> str:
     return ", ".join(f"<code>{E(short(code))}</code>" for code in codes)
 
 
-def card_cause(session: Session, sid: str) -> str:
-    cause = session.cause
-    if cause is None:
-        return '<section class="card ok"><h3>1 · Cause</h3><p>No write to the static field in this log.</p></section>'
+def facts(rows) -> str:
+    body = "".join(f"<tr><th>{E(label)}</th><td>{value}</td></tr>" for label, value in rows)
+    return f'<table class="facts">{body}</table>'
 
-    rows = []
+
+def card_cause(incident: Incident, sid: str) -> str:
+    session, cause = incident.session, incident.cause
+    if cause is None:
+        return '<section class="card warn"><h3>1 · Cause</h3><p>No write to the static field was recorded for this incident.</p></section>'
+
+    rows = [("When", f"<b>{clock(cause.time)}</b> {jump(sid, cause)}")]
     found = WRITE.search(cause.message)
     key = found.group(3) if found else None
-    rows.append(("When", f"<b>{clock(cause.time)}</b> {jump(sid, cause, 'show in log')}"))
 
     name, opened, page = handbook_state(session, cause.time)
-    item, logged_page, recipes = cause_details(session)
+    item, logged_page, recipes = write_context(incident, cause)
     page = logged_page or page
     records_context = any(entry.kind == "CAUSE" for entry in session.entries)
-    missing = ('<span class="muted">none</span>' if records_context
-               else '<span class="muted">not recorded (needs CraftWatch 0.3.0 or newer)</span>')
+    missing = '<span class="muted">none</span>' if records_context else NOT_RECORDED
+
     if name:
         rows.append(("Handbook", f"open since {clock(opened)} ({delta(cause.time, opened).lstrip('+')} before the write)"))
     else:
@@ -300,7 +374,7 @@ def card_cause(session: Session, sid: str) -> str:
         note = " — the spoilage state of a perishable item" if key == "transitionstate" else ""
         rows.append(("Written", f"attribute <code>{E(key)}</code>{note}"))
 
-    filled = first(session.entries[cause.index:], lambda e: e.tag == "attrs-filled")
+    filled = first(session.entries[cause.index:incident.end], lambda e: e.tag == "attrs-filled")
     if filled:
         content = filled.message.split(":", 1)[1].strip() if ":" in filled.message else filled.message
         hours = re.search(r'"freshHours": \[([\d.]+)\].*?"transitionHours": \[([\d.]+)\]', content)
@@ -310,8 +384,8 @@ def card_cause(session: Session, sid: str) -> str:
     frames = culprit_frames(cause)
     if frames:
         listing = "".join(f"<li><code>{E(method)}</code> <span class='muted'>{E(where)}</span></li>" for method, where in frames[:10])
-        rows.append(("Call stack", f"<details><summary>{E(frames[0][0].split('.')[-1])} ← … ← "
-                                   f"{E(next((m for m, _ in frames if 'Handbook' in m), frames[min(len(frames), 10) - 1][0]).split('.')[-2])}"
+        outer = next((method for method, _ in frames if "Handbook" in method), frames[min(len(frames), 10) - 1][0])
+        rows.append(("Call stack", f"<details><summary>{E(frames[0][0].split('.')[-1])} ← … ← {E(outer.split('.')[-2])}"
                                    f"</summary><ol class='frames'>{listing}</ol></details>"))
 
     if recipes:
@@ -331,54 +405,75 @@ def card_cause(session: Session, sid: str) -> str:
                                         '<span class="muted">not recorded. With CraftWatch 0.3.0 or newer the log names the item '
                                         'and the recipes that use it.</span>'))
 
-    body = "".join(f"<tr><th>{E(label)}</th><td>{value}</td></tr>" for label, value in rows)
-    return f'<section class="card bad"><h3>1 · Cause: write to the shared static attributes</h3><table class="facts">{body}</table></section>'
+    if len(incident.writes) > 1:
+        more = []
+        for write in incident.writes[1:]:
+            other_item, other_page, _ = write_context(incident, write)
+            more.append(f"<li>{clock(write.time)} <code>{E(other_item or '?')}</code>"
+                        f"{' on page <code>' + E(other_page) + '</code>' if other_page else ''} {jump(sid, write)}</li>")
+        rows.append(("Further writes", f"<ul class='recipes'>{''.join(more)}</ul>"))
+
+    return f'<section class="card bad"><h3>1 · Cause: write to the shared static attributes</h3>{facts(rows)}</section>'
 
 
-def card_damage(session: Session, sid: str) -> str:
-    if not session.damage:
-        return '<section class="card ok"><h3>2 · Damage</h3><p>No corrupted ingredient stacks in this log.</p></section>'
+def card_damage(incident: Incident, sid: str) -> str:
+    session = incident.session
+    if not incident.damage:
+        return '<section class="card warn"><h3>2 · Damage</h3><p>No corrupted ingredient stacks were reported for this incident.</p></section>'
 
     rows = []
     for side, label in (("S", "Server"), ("C", "Client")):
-        entry = session.damage.get(side)
+        entry = incident.damage.get(side)
         if entry is None:
             rows.append((label, '<span class="muted">nothing reported</span>'))
             continue
         match = DAMAGE.search(entry.message)
-        since = f" ({delta(entry.time, session.cause.time)} after the write)" if session.cause else ""
+        since = f" ({delta(entry.time, incident.cause.time)} after the write)" if incident.cause else ""
         if match:
             stacks, broken, references, examples, _ = match.groups()
-            rows.append((label, f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry, 'show in log')}<br>"
+            rows.append((label, f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry)}<br>"
                                 f"<b>{E(broken)}</b> ingredients no longer recognised as their own item, "
                                 f"{E(stacks)} stacks carry foreign attributes, {E(references)} recipe references affected"
                                 f"<br><span class='muted small'>e.g. {code_list(examples.split(', ')[:6])}</span>"))
         else:
-            count = sum(1 for e in session.entries if e.tag == "damage" and e.side == side)
-            rows.append((label, f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry, 'show in log')}<br>"
+            count = sum(1 for e in incident.entries if e.tag == "damage" and e.side == side)
+            rows.append((label, f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry)}<br>"
                                 f"at least {count} stacks changed <span class='muted'>(CraftWatch 0.1.0 logs one line per stack and cuts off)</span>"))
 
-    recovered = first(session.entries, lambda e: e.kind == "SHARED" and ("wieder ohne Attribute" in e.message or "without attributes again" in e.message)
-                      and session.cause is not None and e.time > session.cause.time)
-    if recovered:
-        rows.append(("Recovered", f"{clock(recovered.time)} on {'server' if recovered.side == 'S' else 'client'} {jump(sid, recovered, 'show in log')}"))
-    elif any(DAMAGE.search(entry.message) for entry in session.damage.values()):
-        last = session.entries[-1].time
-        start = min(entry.time for entry in session.damage.values())
-        rows.append(("Recovered", f"no — still broken at the last line of the log, {delta(last, start).lstrip('+')} after the damage"))
+    start = min(entry.time for entry in incident.damage.values())
+    repair = incident.repair
+    if repair:
+        match = REPAIR.match(repair.message)
+        detail = (f"requested by {E(match.group(1))}: {E(match.group(2))}, <b>{E(match.group(3))}</b> stacks re-attached, "
+                  f"{E(match.group(4))} still broken" if match else E(repair.message))
+        rows.append(("Repaired", f"<b>{clock(repair.time)}</b> ({delta(repair.time, start).lstrip('+')} after the damage) {jump(sid, repair)}<br>{detail}"))
+        worked = crafted_after(session, repair)
+        if worked:
+            entry, grid = worked
+            rows.append(("Crafting again", f"<b>{clock(entry.time)}</b> the server filled the output slot: "
+                                           f"<code>{E(grid.group(3))}</code> {jump(sid, entry)}"))
+        else:
+            rows.append(("Crafting again", '<span class="muted">no successful craft recorded after the repair</span>'))
     else:
-        rows.append(("Recovered", '<span class="muted">not recorded by CraftWatch 0.1.0, which repaired the stacks itself while observing</span>'))
+        recovered = first(incident.entries, lambda e: e.kind == "SHARED" and e.time > start
+                          and ("wieder ohne Attribute" in e.message or "without attributes again" in e.message))
+        if recovered:
+            rows.append(("Recovered", f"{clock(recovered.time)} on the {'server' if recovered.side == 'S' else 'client'} {jump(sid, recovered)}"))
+        elif any(DAMAGE.search(entry.message) for entry in incident.damage.values()):
+            last = session.entries[-1].time
+            rows.append(("Recovered", f"no — still broken at the last line of the log, {delta(last, start).lstrip('+')} after the damage"))
+        else:
+            rows.append(("Recovered", '<span class="muted">not recorded by CraftWatch 0.1.0, which repaired the stacks itself while observing</span>'))
 
-    body = "".join(f"<tr><th>{E(label)}</th><td>{value}</td></tr>" for label, value in rows)
-    return f'<section class="card bad"><h3>2 · Damage: ingredients the game no longer recognises</h3><table class="facts">{body}</table></section>'
+    return f'<section class="card bad"><h3>2 · Damage: ingredients the game no longer recognises</h3>{facts(rows)}</section>'
 
 
-def card_symptom(session: Session, sid: str) -> str:
-    signatures = [entry for entry in session.entries if entry.tag == "signature"]
+def card_symptom(incident: Incident, sid: str) -> str:
+    session = incident.session
+    signatures = [entry for entry in incident.entries if entry.tag == "signature"]
     if not signatures:
-        text = "No failed craft was recorded." if session.cause is None else \
-               "The corruption is in the log, but no craft was attempted afterwards (or the mod repaired it first, as 0.1.0 did)."
-        return f'<section class="card {"ok" if session.cause is None else "warn"}"><h3>3 · Failed craft</h3><p>{E(text)}</p></section>'
+        return ('<section class="card warn"><h3>3 · Failed craft</h3><p>The corruption is in the log, but no craft was attempted '
+                'before the incident ended.</p></section>')
 
     seen, blocks = set(), []
     for entry in signatures:
@@ -386,29 +481,27 @@ def card_symptom(session: Session, sid: str) -> str:
         if not keys or (entry.side, keys[0]) in seen:
             continue
         seen.add((entry.side, keys[0]))
-        if entry.side != "S" and any(side == "S" and key == keys[0] for side, key in seen):
+        if entry.side != "S" and ("S", keys[0]) in seen:
             continue                      # the server already told this story
         recipe_file, output = keys[0].split("->", 1)
-        since = f" ({delta(entry.time, session.cause.time)} after the write)" if session.cause else ""
-        rows = [("When", f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry, 'show in log')}"),
+        since = f" ({delta(entry.time, incident.cause.time)} after the write)" if incident.cause else ""
+        rows = [("When", f"<b>{clock(entry.time)}</b>{since} {jump(sid, entry)}"),
                 ("Recipe", f"<b><code>{E(short(output))}</code></b> <span class='muted'>from {E(short(recipe_file))}</span>")]
 
-        definition, ingredients, _ = recipe_definition(session, entry, entry.side)
+        _, ingredients, _ = recipe_definition(session, entry, entry.side)
         if ingredients:
             rows.append(("Needs", " + ".join(f"{E(quantity)}× <code>{E(short(code))}</code>" for _, _, code, quantity in ingredients)))
 
-        grid_entry, grid = grid_before(session, entry)
+        _, grid = grid_before(session, entry)
         if grid:
             rows.append(("In the grid", f"<code>{E(grid.group(2))}</code>"))
-            rows.append(("Output slot", f"<b>{E('empty' if grid.group(3) in ('leer', 'empty') else grid.group(3))}</b> on the "
+            rows.append(("Output slot", f"<b>{E('empty' if grid.group(3) in EMPTY else grid.group(3))}</b> on the "
                                         f"{'server' if entry.side == 'S' else 'client'}"))
 
         table = ingredient_table(session, entry)
         if table:
             rows.append(("Ingredient check", table))
-
-        body = "".join(f"<tr><th>{E(label)}</th><td>{value}</td></tr>" for label, value in rows)
-        blocks.append(f'<table class="facts">{body}</table>')
+        blocks.append(facts(rows))
 
     return ('<section class="card bad"><h3>3 · Failed craft: the recipe matches, the output slot stays empty</h3>'
             + "<hr>".join(blocks) + "</section>")
@@ -438,11 +531,11 @@ def ingredient_table(session: Session, entry: Entry) -> str:
         for _, candidate, state, own, grid in views.get(side, []):
             if candidate != code:
                 continue
-            verdict = grid or own
-            if verdict == "False":
+            verdict_ = grid or own
+            if verdict_ == "False":
                 reason = "foreign attributes" if "transitionstate" in state or "/1" in state or "/2" in state else "rejected"
                 return f'<td class="no">rejected <span class="small">({E(reason)})</span></td>'
-            if verdict == "True":
+            if verdict_ == "True":
                 return '<td class="yes">accepted</td>'
             return f'<td class="muted">{E(state[:60])}</td>'
         return '<td class="muted">—</td>'
@@ -452,20 +545,31 @@ def ingredient_table(session: Session, entry: Entry) -> str:
     return f'<table class="mini">{head}{body}</table>'
 
 
+def incident_verdict(incident: Incident) -> tuple[str, str]:
+    repaired = f", repaired at {clock(incident.repair.time)}" if incident.repair else ""
+    if incident.symptom:
+        return "bad", f"crafting failed at {clock(incident.symptom.time)}{repaired}"
+    return "warn", f"corruption at {clock(incident.moment.time)}, no failed craft recorded{repaired}"
+
+
 def verdict(session: Session) -> tuple[str, str]:
-    if session.symptom:
-        return "bad", f"Bug occurred: crafting failed at {clock(session.symptom.time)}"
-    if session.cause or session.damage:
-        moment = session.cause or next(iter(session.damage.values()))
-        return "warn", f"Corruption at {clock(moment.time)}, no failed craft recorded"
+    failed = [incident for incident in session.incidents if incident.symptom]
+    if failed:
+        times = ", ".join(clock(incident.symptom.time) for incident in failed)
+        count = "" if len(failed) == 1 else f" {len(failed)} times"
+        return "bad", f"Bug occurred{count}: crafting failed at {times}"
+    if len(session.incidents) > 1:
+        return "warn", f"{len(session.incidents)} incidents with corruption, no failed craft recorded"
+    if session.incidents:
+        return "warn", f"Corruption at {clock(session.incidents[0].moment.time)}, no failed craft recorded"
     return "ok", "No bug in this log"
 
 
 def row_class(entry: Entry) -> str:
     classes = [f"k-{entry.kind}", f"s-{entry.side if entry.side in 'SC' else 'X'}"]
-    if entry.key:
-        classes.append("keymoment")
-    if entry.kind in KEY_KINDS or entry.tag == "handbook":
+    if entry.label:
+        classes.append("repairmoment" if entry.tag == "repair" else "keymoment")
+    if entry.kind in KEY_KINDS or entry.tag == "handbook" or entry.label:
         classes.append("important")
     return " ".join(classes)
 
@@ -484,20 +588,21 @@ def render_message(entry: Entry) -> str:
 
 def timeline(session: Session, sid: str) -> str:
     rows, entries, i = [], session.entries, 0
-    cause_time = session.cause.time if session.cause else None
-    labels = {}
-    if session.cause:
-        labels[session.cause.index] = "1 · cause"
-    for side, entry in session.damage.items():
-        labels[entry.index] = "2 · damage"
-    if session.symptom:
-        labels[session.symptom.index] = "3 · failed craft"
+
+    # Times are shown relative to the write that started the incident an entry belongs to.
+    reference = [None] * len(entries)
+    for incident in session.incidents:
+        if incident.cause:
+            for index in range(incident.start, incident.end):
+                reference[index] = incident.cause.time
 
     def fold_key(entry):
-        if entry.key:
+        if entry.label:
             return None
         if entry.tag in ("canary", "damage", "damage-update") or entry.kind == "DIAG":
             return (entry.side, entry.kind, entry.tag)
+        if entry.kind == "CAUSE" and entry.message.startswith("recipe "):
+            return (entry.side, entry.kind, "recipe")
         return None
 
     while i < len(entries):
@@ -510,21 +615,22 @@ def timeline(session: Session, sid: str) -> str:
         if j - i >= 4:
             run = entries[i:j + 1]
             what = {"canary": "counter-check alarms (false alarms of 0.1.0: recipes that need a character trait)",
-                    "damage": "changed ingredient stacks, one line each"}.get(entry.tag, f"{entry.kind} lines")
-            inner = "".join(row(sid, e, cause_time, labels) for e in run)
-            rows.append(f'<tr class="fold k-{entry.kind} s-{entry.side}"><td>{clock(entry.time)}</td><td></td>'
+                    "damage": "changed ingredient stacks, one line each",
+                    "recipe": "candidate recipes"}.get(key[2], f"{entry.kind} lines")
+            inner = "".join(row(sid, e, reference[e.index]) for e in run)
+            rows.append(f'<tr class="fold k-{entry.kind} s-{entry.side if entry.side in "SC" else "X"}"><td>{clock(entry.time)}</td><td></td>'
                         f'<td><span class="side">{E(entry.side)}</span></td><td><span class="kind">{E(entry.kind)}</span></td>'
                         f'<td><details><summary>{len(run)} × {E(what)}</summary><table class="log inner">{inner}</table></details></td></tr>')
             i = j + 1
             continue
-        rows.append(row(sid, entry, cause_time, labels))
+        rows.append(row(sid, entry, reference[entry.index]))
         i += 1
     return "".join(rows)
 
 
-def row(sid: str, entry: Entry, cause_time, labels) -> str:
+def row(sid: str, entry: Entry, cause_time) -> str:
     relative = delta(entry.time, cause_time) if cause_time else ""
-    label = f'<span class="chip hit">{E(labels[entry.index])}</span> ' if entry.index in labels else ""
+    label = f'<span class="chip {"fix" if entry.tag == "repair" else "hit"}">{E(entry.label)}</span> ' if entry.label else ""
     return (f'<tr id="{anchor(sid, entry)}" class="{row_class(entry)}"><td>{clock(entry.time)}</td><td class="rel">{E(relative)}</td>'
             f'<td><span class="side">{E(entry.side)}</span></td><td><span class="kind">{E(entry.kind)}</span></td>'
             f'<td>{label}{render_message(entry)}</td></tr>')
@@ -532,12 +638,13 @@ def row(sid: str, entry: Entry, cause_time, labels) -> str:
 
 CSS = """
 :root{--bg:#f6f5f1;--panel:#fff;--ink:#1d2125;--muted:#6b7480;--line:#dcdad3;--bad:#b3261e;--badbg:#fdecea;
---warn:#8a5a00;--warnbg:#fff4d6;--ok:#1e6b3a;--okbg:#e6f4ea;--accent:#1f5fae;--code:#efede6;--hit:#ffe08a}
+--warn:#8a5a00;--warnbg:#fff4d6;--ok:#1e6b3a;--okbg:#e6f4ea;--accent:#1f5fae;--code:#efede6;--hit:#ffe08a;--fix:#bfe6c9}
 @media (prefers-color-scheme:dark){:root{--bg:#15171a;--panel:#1e2125;--ink:#e6e8eb;--muted:#9aa3ad;--line:#33383f;
---bad:#ff8a80;--badbg:#3a1f1d;--warn:#ffd27a;--warnbg:#3a2f14;--ok:#8fd6a5;--okbg:#17301f;--accent:#8ab4f8;--code:#2a2e34;--hit:#6b5300}}
+--bad:#ff8a80;--badbg:#3a1f1d;--warn:#ffd27a;--warnbg:#3a2f14;--ok:#8fd6a5;--okbg:#17301f;--accent:#8ab4f8;--code:#2a2e34;--hit:#6b5300;--fix:#1f5a33}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,Segoe UI,sans-serif}
 main{max-width:1180px;margin:0 auto;padding:24px 16px 80px}h1{font-size:24px;margin:0 0 4px}h2{font-size:19px;margin:36px 0 8px}
-h3{font-size:15px;margin:0 0 10px}code,pre,.log{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+h3{font-size:15px;margin:0 0 10px}h3.incident{font-size:16px;margin:24px 0 8px}
+code,pre,.log{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
 code{background:var(--code);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}.muted{color:var(--muted)}.small{font-size:12.5px}
 a{color:var(--accent)}.jump{font-size:12.5px;margin-left:6px}
 .sessions{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px}
@@ -552,7 +659,7 @@ a{color:var(--accent)}.jump{font-size:12.5px;margin-left:6px}
 .facts td{padding:4px 0;vertical-align:top}.recipes,.frames{margin:4px 0;padding-left:20px}.recipes li{margin-bottom:6px}
 .mini{border-collapse:collapse}.mini th,.mini td{border:1px solid var(--line);padding:3px 10px;text-align:left}
 .yes{color:var(--ok)}.no{color:var(--bad);font-weight:600}
-.chip{display:inline-block;border-radius:10px;padding:0 8px;font-size:12px;font-weight:600}.chip.hit{background:var(--hit)}
+.chip{display:inline-block;border-radius:10px;padding:0 8px;font-size:12px;font-weight:600}.chip.hit{background:var(--hit)}.chip.fix{background:var(--fix)}
 .tools{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;margin:10px 0;font-size:13px}
 .log{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
 .log td{padding:3px 8px;border-bottom:1px solid var(--line);vertical-align:top}.log td:nth-child(1){white-space:nowrap}
@@ -561,11 +668,12 @@ a{color:var(--accent)}.jump{font-size:12.5px;margin-left:6px}
 .s-S .side{background:#cfe3ff;color:#123}.s-C .side{background:#d9f2d9;color:#132}
 .kind{display:inline-block;min-width:66px;font-weight:600}
 .k-ALARM .kind,.k-ERROR .kind{color:var(--bad)}.k-TRACE .kind,.k-CAUSE .kind,.k-ATTRS .kind{color:var(--warn)}.k-MARK .kind{color:var(--accent)}
+.k-REPAIR .kind{color:var(--ok)}
 .k-GUI .kind,.k-EVENT .kind,.k-DIAG .kind,.k-BASELINE .kind,.k-START .kind{color:var(--muted)}
-tr.keymoment>td{background:var(--badbg)}tr:target>td{outline:2px solid var(--accent);outline-offset:-2px}
+tr.keymoment>td{background:var(--badbg)}tr.repairmoment>td{background:var(--okbg)}tr:target>td{outline:2px solid var(--accent);outline-offset:-2px}
 pre{white-space:pre-wrap;margin:6px 0;background:var(--code);padding:8px;border-radius:6px;overflow-wrap:anywhere}
 .long{white-space:pre-wrap;margin-top:4px}details>summary{cursor:pointer}.inner{margin-top:6px}
-body.keyonly .log>tbody>tr:not(.important):not(.keymoment):not(.fold){display:none}
+body.keyonly .log>tbody>tr:not(.important):not(.fold){display:none}
 """
 
 JS = """
@@ -579,10 +687,10 @@ document.querySelectorAll('.kindfilter').forEach(function (box) {
     table.querySelectorAll(':scope > tbody > tr.k-' + box.dataset.kind).forEach(function (row) { row.style.display = box.checked ? '' : 'none'; });
   });
 });
-if (location.hash) { var el = document.querySelector(location.hash); if (el) { var d = el.closest('details'); while (d) { d.open = true; d = d.parentElement.closest('details'); } el.scrollIntoView(); } }
+function reveal(el) { var d = el.closest('details'); while (d) { d.open = true; d = d.parentElement.closest('details'); } }
+if (location.hash) { var el = document.querySelector(location.hash); if (el) { reveal(el); el.scrollIntoView(); } }
 document.querySelectorAll('a.jump').forEach(function (link) {
-  link.addEventListener('click', function () { var el = document.querySelector(link.getAttribute('href'));
-    if (!el) return; var d = el.closest('details'); while (d) { d.open = true; d = d.parentElement.closest('details'); } });
+  link.addEventListener('click', function () { var el = document.querySelector(link.getAttribute('href')); if (el) reveal(el); });
 });
 """
 
@@ -599,8 +707,13 @@ def render(sessions: list[Session]) -> str:
         level, text = verdict(session)
         span = (f"{session.entries[0].time:%Y-%m-%d} {clock(session.entries[0].time)[:8]} – {clock(session.entries[-1].time)[:8]}"
                 if session.entries else "empty")
+        listing = ""
+        if len(session.incidents) > 1:
+            listing = "<br>" + "<br>".join(
+                f"<a href='#s{number}-i{incident.number}'>#{incident.number}</a> <span class='small'>{E(incident_verdict(incident)[1])}</span>"
+                for incident in session.incidents)
         out.append(f"<tr><td><a href='#s{number}'>{E(session.path.name)}</a></td><td>{E(span)}</td>"
-                   f"<td>{E(session.mod)} / {E(session.game)}</td><td><b style='color:var(--{level})'>{E(text)}</b></td></tr>")
+                   f"<td>{E(session.mod)} / {E(session.game)}</td><td><b style='color:var(--{level})'>{E(text)}</b>{listing}</td></tr>")
     out.append("</table>")
 
     for number, session in enumerate(sessions, 1):
@@ -612,7 +725,13 @@ def render(sessions: list[Session]) -> str:
             out.append("<p>This file contains no CraftWatch log lines.</p>")
             continue
         out.append(f"<div class='banner {level}'>{E(text)}</div>")
-        out.append(f"<div class='cards'>{card_cause(session, sid)}{card_damage(session, sid)}{card_symptom(session, sid)}</div>")
+
+        total = len(session.incidents)
+        for incident in session.incidents:
+            if total > 1:
+                out.append(f"<h3 class='incident' id='{sid}-i{incident.number}'>Incident {incident.number} of {total}: "
+                           f"{E(incident_verdict(incident)[1])}</h3>")
+            out.append(f"<div class='cards'>{card_cause(incident, sid)}{card_damage(incident, sid)}{card_symptom(incident, sid)}</div>")
 
         kinds = sorted({entry.kind for entry in session.entries})
         filters = "".join(f"<label><input type='checkbox' class='kindfilter' data-table='{sid}-log' data-kind='{E(kind)}' checked> {E(kind)}</label>"

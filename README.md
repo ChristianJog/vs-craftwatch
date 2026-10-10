@@ -5,7 +5,8 @@ logs deviations, in order to catch the "Uncraftable items" bug
 ([VintageStory-Issues#9175](https://github.com/anegostudios/VintageStory-Issues/issues/9175))
 at the moment it starts.
 
-It does not fix the bug. It records what happens.
+It does not fix the bug. It records what happens, and on request it can undo the damage for
+the running session.
 
 **Just want to try it, without any programming?** Go to the
 [quick start](#quick-start-no-programming-needed) at the end of this page.
@@ -25,10 +26,10 @@ i.e. into the static field. In singleplayer the client and the integrated server
 
 ## What the mod does and does not do
 
-The mod is **read-only**. In normal operation it calls neither `GridRecipe.Matches` nor the
-getter `CraftingRecipeIngredient.ResolvedItemStack`, because both reset the attributes of the
-stack they read and would remove the finding. The only exception is the explicit command
-`/cw full`.
+The mod **only observes**. It reads the raw state of the shared stacks from the fast-search
+dictionary and does not go through the getter `CraftingRecipeIngredient.ResolvedItemStack`, which
+writes to the shared stack while reading it. The single exception is the command `/cw repair`
+(see [Repair](#repair)): it changes game state, and only when you call it.
 
 Two Harmony patches observe without changing behaviour:
 
@@ -84,12 +85,33 @@ The game neither overwrites nor archives it. `[S]` is the server side, `[C]` the
 | `SHARED` | change of state after an alarm, or a changed number of shared ingredients |
 | `RECIPE` | the number of grid recipes changed |
 | `DIAG` | breakdown belonging to an alarm, raw state of the ingredients |
+| `REPAIR` | `/cw repair` was run: what was reset on this side |
 | `MARK` | a mark set by hand with `/cw <text>` |
 | `ERROR` | the mod itself failed somewhere |
 
-`/cw <text>` writes a mark and the raw state of your own grid. `/cw full` additionally runs the
-game's full matching — that repairs corrupted ingredients. Chat commands do not arrive while the
-game is paused.
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/cw <text>` | writes a mark and the raw state of your own grid to the log |
+| `/cw full` | like `/cw`, and logs what the game's full matching (`GridRecipe.Matches`) finds for the grid. It finds the recipe even while crafting is broken, and it repairs nothing |
+| `/cw repair` | undoes the damage, see below |
+
+Chat commands do not arrive while the game is paused, e.g. while the handbook is open.
+
+## Repair
+
+`/cw repair` gives the static field a fresh, empty attribute tree and re-attaches to it every
+shared ingredient stack that the fast path accepted at start and no longer accepts. It does this
+on the server and asks every client to do the same. Stacks with legitimate attributes of their
+own are left alone.
+
+- Afterwards take an item out of the crafting grid and put it back in; the game only looks for a
+  recipe when the grid changes.
+- The cause is untouched. The next write to the static field breaks crafting again.
+- The repair is logged (`REPAIR`), and the mod then records the next write in full again, even if
+  it comes from the same place. This makes it possible to find several triggers in one session:
+  provoke the bug, repair, try the next suspect.
 
 ## Report
 
@@ -152,7 +174,8 @@ in the chat.
 If you like, open the chat, type `/cw bug` and press Enter. That puts a mark into the log. Close
 the handbook first: chat commands do not work while the game is paused.
 
-Reloading the world makes crafting work again.
+To get crafting working again, type `/cw repair` in the chat, then take one item out of the
+crafting grid and put it back in. Reloading the world helps as well.
 
 **5. Find the log**
 
