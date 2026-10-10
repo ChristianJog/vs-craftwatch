@@ -92,3 +92,7 @@ game is paused.
 
 Tested against Vintage Story 1.22.7 in singleplayer. The mod reads private state by reflection
 (`deduplicationIndex`) and depends on engine internals that may change with any game update.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

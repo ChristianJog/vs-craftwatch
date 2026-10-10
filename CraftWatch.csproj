@@ -7,6 +7,8 @@
     <AssemblyName>CraftWatch</AssemblyName>
     <RootNamespace>CraftWatch</RootNamespace>
     <DebugType>embedded</DebugType>
+    <!-- Keep local build paths out of the embedded debug information. -->
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\craftwatch\</OutputPath>
     <!-- Install folder of the game; override with -p:VSPath=... -->
@@ -27,6 +29,7 @@
       <Private>false</Private>
     </Reference>
     <None Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="LICENSE" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
