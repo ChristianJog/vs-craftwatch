@@ -31,7 +31,8 @@ dictionary and does not go through the getter `CraftingRecipeIngredient.Resolved
 writes to the shared stack while reading it. The single exception is the command `/cw repair`
 (see [Repair](#repair)): it changes game state, and only when you call it.
 
-Two Harmony patches observe without changing behaviour:
+Two Harmony patches observe without changing behaviour. They are the only use of Harmony in the mod
+and live in `src/Patches/`:
 
 - a prefix in front of the writing methods of `TreeAttribute` compares the instance and, on a
   write to the static field, logs the call stack;
@@ -127,7 +128,7 @@ recipe failed and which handbook recipe probably caused it. See
 | `src/RecipeWatcher.cs` | shared ingredient stacks, static field, recipe data, fast-path probe |
 | `src/GridWatcher.cs` | one player's crafting grid, detection of the signature |
 | `src/ReferenceMatcher.cs` | independent calculation of matching recipes, without the shared stacks |
-| `src/AttrTrace.cs` | Harmony patches: call stack on a write to the static field, and the item being updated |
+| `src/Patches/AttrTrace.cs` | the Harmony patches: call stack on a write to the static field, and the item being updated |
 | `src/Describe.cs` | text representation without side effects |
 | `src/CwLog.cs` | log file |
 | `tools/craftwatch_report.py` | HTML report from the log files |

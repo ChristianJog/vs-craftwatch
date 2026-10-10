@@ -6,7 +6,7 @@ using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Datastructures;
 
-namespace CraftWatch;
+namespace CraftWatch.Patches;
 
 /// <summary>
 /// Records who writes to CraftingRecipeIngredient.defaultEmptyAttributes. That static field has
@@ -17,6 +17,8 @@ namespace CraftWatch;
 ///
 /// A second patch remembers which item is having its transition state updated, so that a write
 /// coming from there can be attributed to that item.
+///
+/// Everything in the mod that uses Harmony lives in this folder.
 /// </summary>
 public static class AttrTrace
 {
