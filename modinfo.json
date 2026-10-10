@@ -1,0 +1,12 @@
+{
+  "type": "code",
+  "modid": "craftwatch",
+  "name": "CraftWatch",
+  "description": "Diagnose-Mod: beobachtet Rezeptabgleich und Crafting-Grid und protokolliert Abweichungen (Issue 9175). Veraendert kein Spielverhalten.",
+  "authors": ["ChristianJog"],
+  "version": "0.1.0",
+  "side": "Universal",
+  "requiredOnClient": false,
+  "requiredOnServer": false,
+  "dependencies": { "game": "1.22.0" }
+}
