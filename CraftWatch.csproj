@@ -9,13 +9,17 @@
     <DebugType>embedded</DebugType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\craftwatch\</OutputPath>
-    <!-- Installationsordner des Spiels; ueberschreibbar mit -p:VSPath=... -->
+    <!-- Install folder of the game; override with -p:VSPath=... -->
     <VSPath Condition="'$(VSPath)' == ''">$(AppData)\Vintagestory</VSPath>
   </PropertyGroup>
 
   <ItemGroup>
     <Reference Include="VintagestoryAPI">
       <HintPath>$(VSPath)\VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(VSPath)\Lib\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="protobuf-net">

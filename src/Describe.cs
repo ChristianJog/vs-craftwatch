@@ -7,10 +7,10 @@ using Vintagestory.API.Datastructures;
 namespace CraftWatch;
 
 /// <summary>
-/// Textdarstellungen fuer das Log. Alles hier liest nur. Wichtig: der Getter
-/// CraftingRecipeIngredient.ResolvedItemStack schreibt beim Lesen in den gemeinsamen Stack
-/// (StackSize = 1, Attributes = defaultEmptyAttributes). Wer den Rohzustand sehen will, muss
-/// deshalb ueber <see cref="SharedStack"/> gehen und nicht ueber den Getter.
+/// Text representations for the log. Everything here only reads. Important: the getter
+/// CraftingRecipeIngredient.ResolvedItemStack writes to the shared stack while reading it
+/// (StackSize = 1, Attributes = defaultEmptyAttributes). To see the raw state, go through
+/// <see cref="SharedStack"/> and not through the getter.
 /// </summary>
 public static class Describe
 {
@@ -22,7 +22,7 @@ public static class Describe
         return dedupIndexField?.GetValue(ingredient) is int index ? index : -2;
     }
 
-    /// <summary>Der gemeinsame Stack der Zutat, ohne den schreibenden Getter zu benutzen.</summary>
+    /// <summary>The ingredient's shared stack, without using the writing getter.</summary>
     public static ItemStack? SharedStack(IWorldAccessor world, CraftingRecipeIngredient ingredient)
     {
         int index = DedupIndex(ingredient);
@@ -31,7 +31,7 @@ public static class Describe
         return dict.GetAt(index).Key.ResolvedItemStack;
     }
 
-    /// <summary>Was den Stack ausmacht: Klasse, Id, Code.</summary>
+    /// <summary>What makes up the stack: class, id, code.</summary>
     public static string Identity(ItemStack? stack)
     {
         if (stack == null) return "null";
@@ -41,7 +41,7 @@ public static class Describe
         return $"{stack.Class}:{stack.Id}:{code}";
     }
 
-    /// <summary>Zustand, den der Abgleich braucht: Menge und Attribute.</summary>
+    /// <summary>The state matching depends on: stack size and attributes.</summary>
     public static string State(ItemStack? stack)
     {
         if (stack == null) return "null";
@@ -75,7 +75,7 @@ public static class Describe
                $"attrs={Attrs(ingredient.ResolvedAttributes)} dedup={DedupIndex(ingredient)}";
     }
 
-    /// <summary>Alles an einem Rezept, was sich nach dem Laden nicht mehr aendern darf.</summary>
+    /// <summary>Everything about a recipe that must not change after loading.</summary>
     public static string Recipe(GridRecipe recipe)
     {
         var text = new StringBuilder();
@@ -105,7 +105,7 @@ public static class Describe
             int count = stack.Attributes?.Count ?? 0;
             if (count > 0) text.Append(Attrs(stack.Attributes));
         }
-        return text.Length == 0 ? "leer" : text.ToString();
+        return text.Length == 0 ? "empty" : text.ToString();
     }
 
     private static string Join(string[]? values) => values == null ? "null" : string.Join(",", values);

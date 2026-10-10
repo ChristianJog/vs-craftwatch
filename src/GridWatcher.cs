@@ -9,14 +9,16 @@ using Vintagestory.API.Config;
 namespace CraftWatch;
 
 /// <summary>
-/// Beobachtet das Crafting-Grid eines Spielers auf einer Seite. Nach jeder Aenderung rechnet es
-/// selbst nach, welche Rezepte passen, und vergleicht das mit dem Ausgabefeld. Findet die eigene
-/// Rechnung ein Rezept, waehrend das Ausgabefeld leer bleibt, ist das die Signatur des Fehlers.
+/// Watches one player's crafting grid on one side. After every change it works out through
+/// <see cref="ReferenceMatcher"/> which recipes match and compares that with the output slot.
+/// If the reference calculation finds a recipe while the output slot stays empty, that is the
+/// signature of the bug. Read-only.
 /// </summary>
 public class GridWatcher
 {
     private const int SuspectAfterMs = 400;
 
+    private readonly ICoreAPI api;
     private readonly string side;
     private readonly RecipeWatcher recipes;
     private readonly Action<GridWatcher, List<GridRecipe>> onSuspect;
@@ -32,8 +34,9 @@ public class GridWatcher
 
     public IPlayer Player { get; }
 
-    public GridWatcher(string side, RecipeWatcher recipes, IPlayer player, Action<GridWatcher, List<GridRecipe>> onSuspect)
+    public GridWatcher(ICoreAPI api, string side, RecipeWatcher recipes, IPlayer player, Action<GridWatcher, List<GridRecipe>> onSuspect)
     {
+        this.api = api;
         this.side = side;
         this.recipes = recipes;
         this.onSuspect = onSuspect;
@@ -64,7 +67,9 @@ public class GridWatcher
 
     public int GridWidth => inventory == null ? 3 : (int)Math.Round(Math.Sqrt(inventory.Count - 1));
 
-    /// <summary>Alle 100 ms aus dem Tick der jeweiligen Seite aufrufen.</summary>
+    public List<GridRecipe> ReferenceMatches() => ReferenceMatcher.Find(api.World, InputSlots(), GridWidth);
+
+    /// <summary>Call every 100 ms from the tick of the respective side.</summary>
     public void Tick()
     {
         try
@@ -74,7 +79,7 @@ public class GridWatcher
                 inventory = Player.InventoryManager?.GetOwnInventory(GlobalConstants.craftingInvClassName) as InventoryBase;
                 if (inventory == null) return;
                 inventory.SlotModified += OnSlotModified;
-                CwLog.Write(side, "GRID", $"{Player.PlayerName}: Crafting-Inventar {inventory.InventoryID} ({inventory.GetType().Name}, {inventory.Count} Slots) wird beobachtet");
+                CwLog.Write(side, "GRID", $"{Player.PlayerName}: watching crafting inventory {inventory.InventoryID} ({inventory.GetType().Name}, {inventory.Count} slots)");
                 pending = true;
             }
 
@@ -103,11 +108,12 @@ public class GridWatcher
         ItemStack? output = Output;
 
         long started = Environment.TickCount64;
-        List<GridRecipe> matches = grid == "leer" ? [] : recipes.FindMatches(Player, slots, GridWidth);
+        List<GridRecipe> matches = ReferenceMatcher.Find(api.World, slots, GridWidth);
         long tookMs = Environment.TickCount64 - started;
 
-        string line = $"{Player.PlayerName}: in=[{grid}] out={(output == null ? "leer" : $"{output.StackSize}x{output.Collectible?.Code}")} " +
-                      $"eigeneRechnung=[{string.Join("; ", matches.Take(4).Select(Key))}{(matches.Count > 4 ? $"; +{matches.Count - 4}" : "")}]";
+        string line = $"{Player.PlayerName}: in=[{grid}] out={(output == null ? "empty" : $"{output.StackSize}x{output.Collectible?.Code}")} " +
+                      $"reference=[{string.Join("; ", matches.Take(4).Select(Key))}{(matches.Count > 4 ? $"; +{matches.Count - 4}" : "")}] " +
+                      $"fastPath=[{FastPath(slots)}]";
         if (line != lastLine)
         {
             lastLine = line;
@@ -119,7 +125,7 @@ public class GridWatcher
         {
             suspectSinceMs = 0;
             suspectGrid = "";
-            // Ein gefuelltes Ausgabefeld gibt denselben Grid-Inhalt wieder fuer eine neue Meldung frei.
+            // A filled output slot releases the same grid content for a new report.
             if (output != null) reportedGrid = "";
             return;
         }
@@ -132,12 +138,25 @@ public class GridWatcher
         suspectMatches = matches;
     }
 
+    /// <summary>Per item in the grid: does the game's fast path still accept it as an ingredient?</summary>
+    private string FastPath(ItemSlot[] slots)
+    {
+        var parts = new List<string>();
+        foreach (ItemStack input in slots.Select(slot => slot.Itemstack).OfType<ItemStack>())
+        {
+            bool? accepts = recipes.FastPathAccepts(input);
+            string text = $"{input.Collectible?.Code?.Path}:{(accepts == null ? "-" : accepts.Value ? "ok" : "BROKEN")}";
+            if (!parts.Contains(text)) parts.Add(text);
+        }
+        return string.Join(", ", parts);
+    }
+
     public static string Key(GridRecipe recipe) => $"{recipe.Name}->{recipe.Output?.Code}";
 
-    /// <summary>Einfache Felder des Inventar-Objekts, auch private (z. B. Zustandsmerker).</summary>
+    /// <summary>Simple fields of the inventory object, including private ones (e.g. state flags).</summary>
     public string InventoryFields()
     {
-        if (inventory == null) return "kein Inventar";
+        if (inventory == null) return "no inventory";
         var text = new StringBuilder();
         for (Type? type = inventory.GetType(); type != null && type != typeof(object); type = type.BaseType)
         {

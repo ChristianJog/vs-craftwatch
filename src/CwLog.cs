@@ -4,9 +4,9 @@ using System.IO;
 namespace CraftWatch;
 
 /// <summary>
-/// Eigene Logdatei, damit die Aufzeichnung weder beim Weltstart ueberschrieben noch von der
-/// Log-Archivierung des Spiels weggeraeumt wird. Client und Server schreiben im Singleplayer
-/// in dieselbe Datei; die Seite steht in jeder Zeile.
+/// A log file of its own, so that the record is neither overwritten when a world starts nor
+/// moved away by the game's log archiving. In singleplayer client and server write to the same
+/// file; every line states the side.
 /// </summary>
 public static class CwLog
 {

@@ -1,46 +1,94 @@
 # CraftWatch
 
-Diagnose-Mod für Vintage Story 1.22. Beobachtet den Rezeptabgleich und das Crafting-Grid und
-protokolliert Abweichungen, um den Fehler „Uncraftable items"
+A diagnostic mod for Vintage Story 1.22. It watches recipe matching and the crafting grid and
+logs deviations, in order to catch the "Uncraftable items" bug
 ([VintageStory-Issues#9175](https://github.com/anegostudios/VintageStory-Issues/issues/9175))
-beim Entstehen zu erfassen. Der Mod greift nicht in das Spielverhalten ein (kein Harmony).
+at the moment it starts.
 
-Analyse und Hintergründe: `E:\kDrive\Games & Twitch\Vintage Story (und Voxel Games)\Crafting-Bug 9175`.
+It does not fix the bug. It records what happens.
 
-## Bauen
+## Background
 
-Voraussetzung: .NET-10-SDK, Spiel unter `%APPDATA%\Vintagestory`.
+Since 1.22 all grid recipes share one `ItemStack` per distinct ingredient
+(`world.FastSearchRecipesByIngredient`). The attributes of such a stack normally are the static
+field `CraftingRecipeIngredient.defaultEmptyAttributes`. If anything writes to that field, the
+game's fast-search comparison (`resolvedItemStack.Satisfies(inputStack)`) fails for every
+ingredient whose shared stack points to it, and the server no longer finds a recipe.
+
+One writer found with this mod: the handbook renders the shared stack of a barrel recipe
+ingredient without cloning it; rendering a perishable item writes its `transitionstate` into the
+stack's attributes, i.e. into the static field. In singleplayer client and integrated server
+share that field.
+
+## What the mod does and does not do
+
+The mod is **read-only**. In normal operation it calls neither `GridRecipe.Matches` nor the
+getter `CraftingRecipeIngredient.ResolvedItemStack`, because both reset the attributes of the
+stack they read and would remove the finding (version 0.1.0 did exactly that). The only exception
+is the explicit command `/cw full`.
+
+A Harmony prefix sits in front of the writing methods of `TreeAttribute`. It only compares the
+instance and, on a write to the static field, logs the call stack. It does not change behaviour;
+it costs one comparison per write.
+
+- **Raw state of the shared stacks**, once per second on each side.
+- **Fast-path probe**: the same comparison the game uses, against a fresh stack of each item.
+- **Static field**: checked every frame on the client and every 100 ms on the server.
+- **Crafting grid**: content, output slot, an independent reference calculation of matching
+  recipes, and per item whether the fast path still accepts it.
+- **Signature**: a recipe matches by reference calculation while the output slot stays empty for
+  0.4 s. The client reports this to the server, which logs its own view of the same moment.
+- **Context**: dialogs opened and closed (also while paused), pause, world save.
+
+The reference calculation is an approximation: it ignores recipes that require a character trait
+and item-specific rules (`MatchesForCrafting`).
+
+## Build
+
+Requires the .NET 10 SDK and the game installed at `%APPDATA%\Vintagestory`.
 
     dotnet build -c Release
 
-Ergebnis in `bin\craftwatch\` (`CraftWatch.dll`, `modinfo.json`). Beide Dateien als Zip nach
-`%APPDATA%\VintagestoryData\Mods` legen. Anderer Installationsort: `-p:VSPath=...`.
+The result is in `bin\craftwatch\` (`CraftWatch.dll`, `modinfo.json`). Zip both files and put the
+zip into `%APPDATA%\VintagestoryData\Mods`. For a different install location pass
+`-p:VSPath=...`.
 
 ## Log
 
-`%APPDATA%\VintagestoryData\CraftWatch\craftwatch-<Datum>_<Zeit>.log`, eine Datei je Spielstart.
-`[S]` ist die Server-Seite, `[C]` die Client-Seite.
+`%APPDATA%\VintagestoryData\CraftWatch\craftwatch-<date>_<time>.log`, one file per game start.
+The game neither overwrites nor archives it. `[S]` is the server side, `[C]` the client side,
+`[-]` the patch (side-independent).
 
-| Kennung | Bedeutung |
+| Kind | Meaning |
 |---|---|
-| `BASELINE` | Grundstand beim Start: Zahl der Rezepte und gemeinsamen Zutaten |
-| `GRID` | Inhalt des Crafting-Grids, Ausgabefeld, Ergebnis der eigenen Rechnung |
-| `GUI` | Dialog geöffnet oder geschlossen (nur Client) |
-| `EVENT` | Pause, Speichern, Spieler kommt oder geht |
-| `SHARED` | ein gemeinsamer Zutaten-Stack hat Menge ≠ 1 oder Attribute |
-| `ATTRS` | die statischen Standard-Attribute wurden befüllt oder ersetzt |
-| `ALARM` | Befund: Zutat ersetzt, Rezeptdaten geändert, Gegenprobe schlägt fehl, Ausgabefeld bleibt trotz passendem Rezept leer |
-| `DIAG` | Zerlegung zu einem Alarm |
-| `MARK` | von Hand gesetzte Markierung über `/cw <text>` |
+| `BASELINE` | state at start: number of recipes and shared ingredients |
+| `GRID` | crafting grid content, output slot, reference calculation, fast path per item |
+| `GUI` | dialog opened or closed (client only) |
+| `EVENT` | pause, world save, player joins or leaves |
+| `TRACE` | write to the static field, with call stack — the culprit |
+| `ATTRS` | the static field became non-empty, empty again, or was replaced by the game |
+| `ALARM` | a finding: shared stacks carry attributes and the fast path no longer accepts items; an ingredient was replaced; recipe data changed; `SIGNATURE` = a recipe matches and the output slot stays empty |
+| `SHARED` | change of state after an alarm |
+| `DIAG` | breakdown belonging to an alarm, raw state of the ingredients |
+| `MARK` | a mark set by hand with `/cw <text>` |
 
-Im Spiel schreibt `/cw <text>` eine Markierung und den vollständigen Zustand des eigenen Grids.
+`/cw <text>` writes a mark and the raw state of your own grid. `/cw full` additionally runs the
+game's full matching — that repairs corrupted ingredients. Chat commands do not arrive while the
+game is paused.
 
-## Aufbau
+## Source layout
 
-| Datei | Aufgabe |
+| File | Purpose |
 |---|---|
-| `src/CraftWatchSystem.cs` | Einstieg, Ereignisse, Meldung Client → Server, Befehl `/cw` |
-| `src/RecipeWatcher.cs` | gemeinsame Zutaten-Stacks, Standard-Attribute, Rezeptdaten, Gegenprobe |
-| `src/GridWatcher.cs` | Crafting-Grid eines Spielers, Erkennung der Fehlersignatur |
-| `src/Describe.cs` | Textdarstellung ohne Seiteneffekte |
-| `src/CwLog.cs` | Logdatei |
+| `src/CraftWatchSystem.cs` | entry point, events, client → server report, `/cw` command |
+| `src/RecipeWatcher.cs` | shared ingredient stacks, static field, recipe data, fast-path probe |
+| `src/GridWatcher.cs` | one player's crafting grid, detection of the signature |
+| `src/ReferenceMatcher.cs` | independent calculation of matching recipes, without the shared stacks |
+| `src/AttrTrace.cs` | Harmony patch: call stack on a write to the static field |
+| `src/Describe.cs` | text representation without side effects |
+| `src/CwLog.cs` | log file |
+
+## Status
+
+Tested against Vintage Story 1.22.7 in singleplayer. The mod reads private state by reflection
+(`deduplicationIndex`) and depends on engine internals that may change with any game update.
